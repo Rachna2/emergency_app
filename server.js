@@ -1,5 +1,4 @@
 const express = require('express');
-const https = require('https');  // Use HTTPS instead of HTTP
 const mongoose = require('mongoose');
 const { Server } = require('socket.io');
 const cors = require('cors');
@@ -9,72 +8,86 @@ const NodeCache = require('node-cache');
 const fs = require('fs');
 const path = require('path');
 
+// Import the User model
+const User = require('./models/User');
+
 dotenv.config();
 
 const app = express();
-const options = {
-  key: fs.readFileSync(path.join(__dirname, 'ssl', 'server-key.pem')),
-  cert: fs.readFileSync(path.join(__dirname, 'ssl', 'server-cert.pem')),
-};
+const PORT = process.env.PORT || 3000;  // Use Render's assigned PORT or 3000 for local testing
 
-const server = https.createServer(options, app);  // Use HTTPS
+// Check environment and decide between HTTP or HTTPS
+let server;
+if (process.env.NODE_ENV === 'production') {
+  // Production environment (use HTTPS)
+  const options = {
+    key: fs.readFileSync(path.join(__dirname, 'ssl', 'server-key.pem')), // Path to your server key
+    cert: fs.readFileSync(path.join(__dirname, 'ssl', 'server-cert.pem')), // Path to your server cert
+  };
+  server = require('https').createServer(options, app); // Create HTTPS server
+} else {
+  // Local development environment (use HTTP)
+  server = require('http').createServer(app); // Use HTTP server for local testing
+}
 
+// Socket.IO setup
 const io = new Server(server);
 const cache = new NodeCache({ stdTTL: 300 }); // Cache for 5 minutes
 
-const PORT = process.env.PORT || 3000;
+// Health Check Endpoint for Render to use
+app.get('/health', (req, res) => res.status(200).send('Server is healthy'));
 
-// MongoDB connection
-mongoose.connect(process.env.MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
+// MongoDB connection setup
+mongoose
+  .connect(process.env.MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
   .then(() => console.log('MongoDB connected'))
   .catch((err) => console.error('MongoDB connection error:', err));
 
-// Middleware
+// Middleware for CORS and JSON parsing
 app.use(express.json());
-app.use(cors({
-  origin: [
-    'https://a-t.onrender.com',  // Your Render app's URL
-    'http://localhost:3000',     // Your local development URL
-  ],
-  methods: ['GET', 'POST', 'PUT', 'DELETE'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-}));
-
-// MongoDB Schemas and Models
-const UserSchema = new mongoose.Schema({
-  name: String,
-  role: String,
-  licensePlate: String,
-  phone: String,
-  location: {
-    lat: Number,
-    lon: Number,
-  },
-});
-const User = mongoose.model('User', UserSchema);
+app.use(
+  cors({
+    origin: [
+      'https://a-t.onrender.com', // Render app's URL
+      'http://localhost:3000', // Local development URL
+    ],
+    methods: ['GET', 'POST', 'PUT', 'DELETE'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+  })
+);
 
 // Routes
+
+// Example route to register a user
 app.post('/register', async (req, res) => {
   try {
-    const user = new User(req.body);
-    await user.save();
+    const user = new User(req.body);  // Create a new user instance from the request body
+    await user.save();  // Save the user to MongoDB
     res.status(201).send({ message: 'Registration successful!' });
   } catch (err) {
     res.status(500).send({ error: err.message });
   }
 });
 
+// Example route to login a user
 app.post('/login', async (req, res) => {
   try {
-    const user = await User.findOne({ name: req.body.name, phone: req.body.phone });
-    if (!user) return res.status(404).send({ error: 'User not found!' });
-    res.status(200).send(user);
+    const user = await User.findOne({
+      name: req.body.name,
+      phone: req.body.phone,
+    });
+
+    if (!user) {
+      return res.status(404).send({ error: 'User not found!' });
+    }
+
+    res.status(200).send(user);  // Send the user data back if login is successful
   } catch (err) {
     res.status(500).send({ error: err.message });
   }
 });
 
-// Hospitals Endpoint
+// Route to fetch hospitals near a location
 app.get('/hospitals', async (req, res) => {
   try {
     const { lat, lon } = req.query;
@@ -92,14 +105,14 @@ app.get('/hospitals', async (req, res) => {
       lon: el.lon,
     }));
 
-    cache.set(cacheKey, hospitals);
+    cache.set(cacheKey, hospitals);  // Cache the hospital data
     res.status(200).send(hospitals);
   } catch (err) {
     res.status(500).send({ error: 'Error fetching hospitals data' });
   }
 });
 
-// Route Endpoint
+// Route to get directions (via OSRM)
 app.get('/route', async (req, res) => {
   try {
     const { startLat, startLon, endLat, endLon } = req.query;
@@ -129,7 +142,9 @@ io.on('connection', (socket) => {
 
   socket.on('emergency', (data) => {
     const { licensePlate, location } = data;
-    const nearestPolice = Object.values(connectedUsers).find(user => user.role === 'Traffic Police');
+    const nearestPolice = Object.values(connectedUsers).find(
+      (user) => user.role === 'Traffic Police'
+    );
     if (nearestPolice) {
       nearestPolice.socket.emit('emergencyAlert', { licensePlate, location });
     } else {
@@ -143,7 +158,7 @@ io.on('connection', (socket) => {
   });
 });
 
-// Start Server (HTTPS)
-server.listen(PORT, () => {
-  console.log(`Server running on https://localhost:${PORT}`);
+// Start the server
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server running on port ${PORT}`);
 });
