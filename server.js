@@ -14,80 +14,69 @@ const User = require('./models/User');
 dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 3000;  // Use Render's assigned PORT or 3000 for local testing
+const PORT = process.env.PORT || 3000;
 
-// Check environment and decide between HTTP or HTTPS
+// Choose HTTP or HTTPS based on environment
 let server;
 if (process.env.NODE_ENV === 'production') {
-  // Production environment (use HTTPS)
   const options = {
-    key: fs.readFileSync(path.join(__dirname, 'ssl', 'server-key.pem')), // Path to your server key
-    cert: fs.readFileSync(path.join(__dirname, 'ssl', 'server-cert.pem')), // Path to your server cert
+    key: fs.readFileSync(path.join(__dirname, 'ssl', 'server-key.pem')),
+    cert: fs.readFileSync(path.join(__dirname, 'ssl', 'server-cert.pem')),
   };
-  server = require('https').createServer(options, app); // Create HTTPS server
+  server = require('https').createServer(options, app);
 } else {
-  // Local development environment (use HTTP)
-  server = require('http').createServer(app); // Use HTTP server for local testing
+  server = require('http').createServer(app);
 }
 
 // Socket.IO setup
-const io = new Server(server);
+const io = new Server(server, {
+  cors: {
+    origin: ['https://a-t.onrender.com', 'http://localhost:3000'],
+    methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  },
+});
 const cache = new NodeCache({ stdTTL: 300 }); // Cache for 5 minutes
 
-// Health Check Endpoint for Render to use
-app.get('/health', (req, res) => res.status(200).send('Server is healthy'));
-
-// MongoDB connection setup
+// MongoDB connection
 mongoose
   .connect(process.env.MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
   .then(() => console.log('MongoDB connected'))
   .catch((err) => console.error('MongoDB connection error:', err));
 
-// Middleware for CORS and JSON parsing
+// Middleware
 app.use(express.json());
 app.use(
   cors({
-    origin: [
-      'https://a-t.onrender.com', // Render app's URL
-      'http://localhost:3000', // Local development URL
-    ],
+    origin: ['https://a-t.onrender.com', 'http://localhost:3000'],
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
     allowedHeaders: ['Content-Type', 'Authorization'],
   })
 );
 
-// Routes
+// Health check
+app.get('/health', (req, res) => res.status(200).send('Server is healthy'));
 
-// Example route to register a user
+// Routes
 app.post('/register', async (req, res) => {
   try {
-    const user = new User(req.body);  // Create a new user instance from the request body
-    await user.save();  // Save the user to MongoDB
+    const user = new User(req.body);
+    await user.save();
     res.status(201).send({ message: 'Registration successful!' });
   } catch (err) {
     res.status(500).send({ error: err.message });
   }
 });
 
-// Example route to login a user
 app.post('/login', async (req, res) => {
   try {
-    const user = await User.findOne({
-      name: req.body.name,
-      phone: req.body.phone,
-    });
-
-    if (!user) {
-      return res.status(404).send({ error: 'User not found!' });
-    }
-
-    res.status(200).send(user);  // Send the user data back if login is successful
+    const user = await User.findOne({ name: req.body.name, phone: req.body.phone });
+    if (!user) return res.status(404).send({ error: 'User not found!' });
+    res.status(200).send(user);
   } catch (err) {
     res.status(500).send({ error: err.message });
   }
 });
 
-// Route to fetch hospitals near a location
 app.get('/hospitals', async (req, res) => {
   try {
     const { lat, lon } = req.query;
@@ -105,20 +94,19 @@ app.get('/hospitals', async (req, res) => {
       lon: el.lon,
     }));
 
-    cache.set(cacheKey, hospitals);  // Cache the hospital data
+    cache.set(cacheKey, hospitals);
     res.status(200).send(hospitals);
   } catch (err) {
     res.status(500).send({ error: 'Error fetching hospitals data' });
   }
 });
 
-// Route to get directions (via OSRM)
 app.get('/route', async (req, res) => {
   try {
     const { startLat, startLon, endLat, endLon } = req.query;
     const osrmUrl = `http://router.project-osrm.org/route/v1/driving/${startLon},${startLat};${endLon},${endLat}?overview=full&geometries=geojson`;
-
     const response = await axios.get(osrmUrl, { timeout: 10000 });
+
     if (response.data.routes.length > 0) {
       res.status(200).send(response.data.routes[0].geometry);
     } else {
@@ -130,30 +118,65 @@ app.get('/route', async (req, res) => {
 });
 
 // Socket.IO Events
-let connectedUsers = {};
+const connectedUsers = {};
 
 io.on('connection', (socket) => {
-  console.log('User connected:', socket.id);
+  console.log(`User connected: ${socket.id}`);
 
   socket.on('registerRole', (data) => {
     connectedUsers[socket.id] = { ...data, socket };
-    console.log(`${data.role} registered: ${data.name}`);
+    console.log(`${data.role} registered: ${data.name || data.licensePlate}`);
   });
 
   socket.on('emergency', (data) => {
     const { licensePlate, location } = data;
+    if (!licensePlate) return console.error('Emergency missing license plate.');
+
     const nearestPolice = Object.values(connectedUsers).find(
       (user) => user.role === 'Traffic Police'
     );
+
     if (nearestPolice) {
       nearestPolice.socket.emit('emergencyAlert', { licensePlate, location });
+      socket.emit('policeLocation', { lat: nearestPolice.lat, lon: nearestPolice.lon });
+      console.log(`Alert sent to police for ambulance: ${licensePlate}`);
     } else {
-      console.error('No Traffic Police available to handle the emergency.');
+      console.error('No Traffic Police available.');
+    }
+  });
+
+  socket.on('trafficStatus', (data) => {
+    const { status, licensePlate } = data;
+    const targetSocketId = Object.keys(connectedUsers).find(
+      (id) =>
+        connectedUsers[id].role === 'Ambulance Driver' &&
+        connectedUsers[id].licensePlate === licensePlate
+    );
+
+    if (targetSocketId) {
+      io.to(targetSocketId).emit('trafficStatusUpdate', { status });
+      console.log(`Traffic status updated for ambulance: ${licensePlate}`);
+    } else {
+      console.error(`Ambulance with license plate ${licensePlate} not found.`);
+    }
+  });
+
+  socket.on('updateLocation', (data) => {
+    const { lat, lon } = data;
+    if (connectedUsers[socket.id]) {
+      connectedUsers[socket.id].lat = lat;
+      connectedUsers[socket.id].lon = lon;
+      socket.broadcast.emit('liveLocationUpdate', {
+        id: socket.id,
+        lat,
+        lon,
+        role: connectedUsers[socket.id].role,
+      });
     }
   });
 
   socket.on('disconnect', () => {
-    console.log('User disconnected:', socket.id);
+    console.log(`User disconnected: ${socket.id}`);
     delete connectedUsers[socket.id];
   });
 });
